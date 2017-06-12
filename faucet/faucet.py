@@ -163,9 +163,10 @@ class Faucet(app_manager.RyuApp):
             set(list(self.valves.keys())) -
             set([valve.dp_id for valve in new_dps]))
         for new_dp in new_dps:
+            cold_start = True
             if new_dp.dp_id in self.valves:
                 valve = self.valves[new_dp.dp_id]
-                flowmods = valve.reload_config(new_dp)
+                cold_start, flowmods = valve.reload_config(new_dp)
                 self._send_flow_msgs(new_dp.dp_id, flowmods)
             else:
                 # pylint: disable=no-member
@@ -175,6 +176,13 @@ class Faucet(app_manager.RyuApp):
                 else:
                     valve = valve_cl(new_dp, self.logname)
                     self.valves[new_dp.dp_id] = valve
+            # pylint: disable=no-member
+            if cold_start:
+                self.metrics.faucet_config_reload_cold.labels(
+                    dpid=hex(new_dp.dp_id)).inc()
+            else:
+                self.metrics.faucet_config_reload_warm.labels(
+                    dpid=hex(new_dp.dp_id)).inc()
             valve.update_config_metrics(self.metrics)
         for deleted_valve_dpid in deleted_valve_dpids:
             self.logger.info(
@@ -309,7 +317,7 @@ class Faucet(app_manager.RyuApp):
             return
 
         in_port = msg.match['in_port']
-         # pylint: disable=no-member
+        # pylint: disable=no-member
         self.metrics.of_packet_ins.labels(
             dpid=hex(dp_id)).inc()
         flowmods = valve.rcv_packet(
@@ -389,11 +397,11 @@ class Faucet(app_manager.RyuApp):
             if ryu_event.enter:
                 self.metrics.of_dp_connections.labels(
                     dpid=hex(dp_id)).inc()
+                self.logger.debug('%s connected', dpid_log(dp_id))
+                self._handler_datapath(ryu_dp)
                 # pylint: disable=no-member
                 self.metrics.dp_status.labels(
                     dpid=hex(dp_id)).set(1)
-                self.logger.debug('%s connected', dpid_log(dp_id))
-                self._handler_datapath(ryu_dp)
             else:
                 self.metrics.of_dp_disconnections.labels(
                     dpid=hex(dp_id)).inc()

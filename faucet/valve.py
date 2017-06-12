@@ -20,12 +20,11 @@
 import copy
 import logging
 import time
-import os
 
 from collections import namedtuple
 
 try:
-    import aruba.aruba_pipeline as aruba
+    import tfm_pipeline
     import valve_acl
     import valve_flood
     import valve_host
@@ -34,7 +33,7 @@ try:
     import valve_route
     import valve_util
 except ImportError:
-    from faucet.aruba import aruba_pipeline as aruba
+    from faucet import tfm_pipeline 
     from faucet import valve_acl
     from faucet import valve_flood
     from faucet import valve_host
@@ -46,7 +45,6 @@ except ImportError:
 from ryu.lib import mac
 from ryu.ofproto import ether
 from ryu.ofproto import ofproto_v1_3 as ofp
-from ryu.ofproto import ofproto_v1_3_parser as parser
 
 
 def valve_factory(dp):
@@ -58,6 +56,7 @@ def valve_factory(dp):
     SUPPORTED_HARDWARE = {
         'Allied-Telesis': Valve,
         'Aruba': ArubaValve,
+        'GenericTFM': TfmValve,
         'Lagopus': Valve,
         'Netronome': Valve,
         'NoviFlow': Valve,
@@ -195,7 +194,7 @@ class Valve(object):
         """
         return []
 
-    def debug_match_types(self, ofmsg):
+    def _debug_match_types(self, ofmsg):
         match_oxm_fields = ofmsg.match.to_jsondict()['OFPMatch']['oxm_fields']
         match_types = []
         for field in match_oxm_fields:
@@ -211,24 +210,28 @@ class Valve(object):
                 match_types.append(field)
         return match_types
 
-    def debug_instruction_types(self, ofmsg):
+    def _debug_action_types(self, actions, action_types):
+        for action in actions:
+            for action_name in actions:
+                if action_name == 'OFPActionSetField':
+                    oxmtlv = action['OFPActionSetField']['field']['OXMTlv']
+                    field = oxmtlv['field']
+                    mask = oxmtlv['mask']
+                    action_type = '_'.join((action_name, field))
+                    if mask is not None:
+                        action_type = '/'.join((action_type, mask))
+                        action_types.add(action_type)
+                    else:
+                        action_types.add(action_name)
+
+    def _debug_instruction_types(self, ofmsg):
         inst_types = set()
         action_types = set()
         for inst in ofmsg.instructions:
             for inst_name, inst_value in list(inst.to_jsondict().items()):
                 if inst_name == 'OFPInstructionActions':
-                    for action in inst_value['actions']:
-                        for action_name in action:
-                            if action_name == 'OFPActionSetField':
-                                oxmtlv = action['OFPActionSetField']['field']['OXMTlv']
-                                field = oxmtlv['field']
-                                mask = oxmtlv['mask']
-                                action_type = '_'.join((action_name, field))
-                                if mask is not None:
-                                    action_type = '/'.join((action_type, mask))
-                                action_types.add(action_type)
-                            else:
-                                action_types.add(action_name)
+                    self._debug_action_types(
+                        inst_value['actions'], action_types)
                 else:
                     inst_types.add(inst_name)
         return list(inst_types), list(action_types)
@@ -250,8 +253,8 @@ class Valve(object):
                     '%s %s', log_prefix, ofmsg)
                 # TODO: log group operations as well.
                 if valve_of.is_flowmod(ofmsg):
-                    match_types = self.debug_match_types(ofmsg)
-                    inst_types, action_types = self.debug_instruction_types(ofmsg)
+                    match_types = self._debug_match_types(ofmsg)
+                    inst_types, action_types = self._debug_instruction_types(ofmsg)
                     self.ofchannel_logger.debug(
                         '%s FlowMod types table: %u match: %s instructions: %s actions: %s',
                         log_prefix, ofmsg.table_id,
@@ -573,9 +576,8 @@ class Valve(object):
                 all_port_nums.add(port_num)
 
         # now configure all ports
-        for port_num in all_port_nums:
-            ofmsgs.extend(self.port_add(
-                self.dp.dp_id, port_num, cold_start=True))
+        ofmsgs.extend(self.ports_add(
+            self.dp.dp_id, all_port_nums, cold_start=True))
 
         return ofmsgs
 
@@ -585,10 +587,11 @@ class Valve(object):
         elif reason == ofp.OFPPR_DELETE:
             return self.port_delete(dp_id, port_no)
         elif reason == ofp.OFPPR_MODIFY:
+            ofmsgs = []
+            ofmsgs.extend(self.port_delete(dp_id, port_no))
             if port_status:
-                return self.port_add(dp_id, port_no)
-            else:
-                return self.port_delete(dp_id, port_no)
+                ofmsgs.extend(self.port_add(dp_id, port_no))
+            return ofmsgs
         self.dpid_warn('Unhandled port status %s for port %u' % (
             reason, port_no))
         return []
@@ -616,7 +619,7 @@ class Valve(object):
         """
         if self._ignore_dpid(dp_id):
             return []
-        self.dpid_log('Configuring DP')
+        self.dpid_log('Cold start configuring DP')
         ofmsgs = []
         ofmsgs.extend(self._add_default_flows())
         ofmsgs.extend(self._add_ports_and_vlans(discovered_up_port_nums))
@@ -709,121 +712,133 @@ class Valve(object):
         ofmsgs.extend(self.valve_flowdel(
             self.dp.eth_dst_table, out_port=port.number))
         if port.permanent_learn:
-            if old_eth_srcs is not None:
-                for eth_src in old_eth_srcs:
-                    ofmsgs.extend(self.valve_flowdel(
-                        self.dp.eth_src_table,
-                        match=self.valve_in_match(
-                            self.dp.eth_src_table, eth_src=eth_src)))
+            for eth_src in old_eth_srcs:
+                ofmsgs.extend(self.valve_flowdel(
+                    self.dp.eth_src_table,
+                    match=self.valve_in_match(
+                        self.dp.eth_src_table, eth_src=eth_src)))
         return ofmsgs
 
-    def port_add(self, dp_id, port_num,
-                 modify=False, cold_start=False, old_eth_srcs=None):
-        """Handle the addition of a port.
+    def ports_add(self, dp_id, port_nums, cold_start=False):
+        """Handle the addition of ports.
 
         Args:
             dp_id (int): datapath ID.
-            port_num (int): port number.
-            modify (bool): True modifying an existing port config.
+            port_num (list): list of port numbers.
             cold_start (bool): True if configuring datapath from scratch.
-            old_eth_srcs (list): eth MAC of antisproofing hosts
         Returns:
             list: OpenFlow messages, if any.
         """
-        if self._ignore_dpid(dp_id) or valve_of.ignore_port(port_num):
+        if self._ignore_dpid(dp_id):
             return []
 
-        if port_num not in self.dp.ports:
-            self.dpid_log(
-                'Ignoring port:%u not present in configuration file' % port_num)
-            return []
-
-        port = self.dp.ports[port_num]
-        port.phys_up = True
         ofmsgs = []
-        self.dpid_log('Sending config for port %s' % port)
+        vlans_with_ports_added = set()
 
-        if not cold_start:
-            ofmsgs.extend(self._port_delete_flows(port, old_eth_srcs))
-            if modify:
-                self.dpid_log('Port %s modified' % port)
+        for port_num in port_nums:
+            if valve_of.ignore_port(port_num):
+                continue
+            if port_num not in self.dp.ports:
+                self.dpid_log(
+                    'Ignoring port:%u not present in configuration file' % port_num)
+                continue
+
+            port = self.dp.ports[port_num]
+            port.phys_up = True
+            self.dpid_log('Sending config for port %s' % port)
+
+            if not port.running():
+                continue
+
+            # Port is a mirror destination; drop all input packets
+            if port.mirror_destination:
+                ofmsgs.append(self.valve_flowdrop(
+                    self.dp.vlan_table,
+                    match=self.valve_in_match(self.dp.vlan_table, in_port=port_num),
+                    priority=self.dp.highest_priority))
+                continue
+
+            # Add ACL if any.
+            acl_ofmsgs = self._port_add_acl(port_num)
+            ofmsgs.extend(acl_ofmsgs)
+
+            tagged_vlans_with_port = port.tagged_vlans
+            untagged_vlans_with_port = [
+                vlan for vlan in [port.native_vlan] if vlan is not None]
+            port_vlans = tagged_vlans_with_port + untagged_vlans_with_port
+
+            # If this is a stacking port, accept all VLANs (came from another FAUCET)
+            if port.stack is not None:
+                ofmsgs.append(self.valve_flowmod(
+                    self.dp.vlan_table,
+                    match=self.valve_in_match(self.dp.vlan_table, in_port=port_num),
+                    priority=self.dp.low_priority,
+                    inst=[valve_of.goto_table(self.dp.eth_src_table)]))
+                port_vlans = list(self.dp.vlans.values())
             else:
-                self.dpid_log('Port %s added' % port)
+                mirror_act = []
+                # Add mirroring if any
+                if port.mirror:
+                    mirror_act = [valve_of.output_port(port.mirror)]
+                # Add port/to VLAN rules.
+                ofmsgs.extend(self._port_add_vlans(
+                    port, mirror_act, tagged_vlans_with_port, untagged_vlans_with_port))
 
-        if not port.running():
-            return ofmsgs
-
-        # Port is a mirror destination; drop all input packets
-        if port.mirror_destination:
-            ofmsgs.append(self.valve_flowdrop(
-                self.dp.vlan_table,
-                match=self.valve_in_match(self.dp.vlan_table, in_port=port_num),
-                priority=self.dp.highest_priority))
-            return ofmsgs
-
-        # Add ACL if any.
-        acl_ofmsgs = self._port_add_acl(port_num)
-        ofmsgs.extend(acl_ofmsgs)
-
-        vlans = list(self.dp.vlans.values())
-        tagged_vlans_with_port = [
-            vlan for vlan in vlans if port in vlan.tagged]
-        untagged_vlans_with_port = [
-            vlan for vlan in vlans if port in vlan.untagged]
-        port_vlans = tagged_vlans_with_port + untagged_vlans_with_port
-
-        # If this is a stacking port, accept all VLANs (came from another FAUCET)
-        if port.stack is not None:
-            ofmsgs.append(self.valve_flowmod(
-                self.dp.vlan_table,
-                match=self.valve_in_match(self.dp.vlan_table, in_port=port_num),
-                priority=self.dp.low_priority,
-                inst=[valve_of.goto_table(self.dp.eth_src_table)]))
-            port_vlans = vlans
-        else:
-            mirror_act = []
-            # Add mirroring if any
-            if port.mirror:
-                mirror_act = [valve_of.output_port(port.mirror)]
-            # Add port/to VLAN rules.
-            ofmsgs.extend(self._port_add_vlans(
-                port, mirror_act, tagged_vlans_with_port, untagged_vlans_with_port))
+            for vlan in port_vlans:
+                vlans_with_ports_added.add(vlan)
 
         # Only update flooding rules if not cold starting.
         if not cold_start:
-            for vlan in port_vlans:
+            for vlan in vlans_with_ports_added:
                 ofmsgs.extend(self.flood_manager.build_flood_rules(vlan))
 
         return ofmsgs
 
-    def port_delete(self, dp_id, port_num, old_eth_srcs=None):
-        """Handle the deletion of a port.
+    def port_add(self, dp_id, port_num):
+        return self.ports_add(dp_id, [port_num])
+
+    def ports_delete(self, dp_id, port_nums):
+        """Handle the deletion of ports.
 
         Args:
             dp_id (int): datapath ID.
-            port_num (int): port number.
-            old_eth_srcs (list): list of MAC learned on this port
+            port_nums (list): list of port numbers.
         Returns:
             list: OpenFlow messages, if any.
         """
-        if self._ignore_dpid(dp_id) or valve_of.ignore_port(port_num):
+        if self._ignore_dpid(dp_id):
             return []
-
-        if port_num not in self.dp.ports:
-            return []
-
-        port = self.dp.ports[port_num]
-        port.phys_up = False
-        self.dpid_warn('Port %s down' % port)
 
         ofmsgs = []
-        ofmsgs.extend(self._port_delete_flows(port, old_eth_srcs))
-        for vlan in list(self.dp.vlans.values()):
-            if port in vlan.get_ports():
-                ofmsgs.extend(self.flood_manager.build_flood_rules(
-                    vlan, modify=True))
+        vlans_with_deleted_ports = set()
+
+        for port_num in port_nums:
+            if valve_of.ignore_port(port_num):
+                continue
+            if port_num not in self.dp.ports:
+                continue
+            port = self.dp.ports[port_num]
+            port.phys_up = False
+            self.dpid_warn('%s down' % port)
+
+            ofmsgs.extend(
+                self._port_delete_flows(
+                    port,
+                    self._get_eth_srcs_learned_on_port(self.dp, port.number)))
+            untagged_vlans_with_port = [
+                vlan for vlan in [port.native_vlan] if vlan is not None]
+            port_vlans = port.tagged_vlans + untagged_vlans_with_port
+            for vlan in port_vlans:
+                vlans_with_deleted_ports.add(vlan)
+
+        for vlan in vlans_with_deleted_ports:
+            ofmsgs.extend(self.flood_manager.build_flood_rules(
+                vlan, modify=True))
 
         return ofmsgs
+
+    def port_delete(self, dp_id, port_num):
+        return self.ports_delete(dp_id, [port_num])
 
     def control_plane_handler(self, pkt_meta):
         """Handle a packet probably destined to FAUCET's route managers.
@@ -927,8 +942,6 @@ class Valve(object):
             self.dpid_log(
                 'host learned via stack port to %s' % edge_dp.name)
 
-        # TODO: it would be good to be able to notify an external
-        # system upon re/learning a host.
         ofmsgs.extend(self.host_manager.learn_host_on_vlan_port(
             learn_port, pkt_meta.vlan, pkt_meta.eth_src))
 
@@ -1143,10 +1156,9 @@ class Valve(object):
         old_eth_srcs = []
         if port_no in dp.ports:
             port = dp.ports[port_no]
-            for vid in [port.native_vlan] + port.tagged_vlans:
-                if vid is None:
+            for vlan in [port.native_vlan] + port.tagged_vlans:
+                if vlan is None:
                     continue
-                vlan = dp.vlans[vid]
                 for eth_src, host_cache_entry in list(vlan.host_cache.items()):
                     if host_cache_entry.port_num == port_no:
                         old_eth_srcs.append(eth_src)
@@ -1181,8 +1193,10 @@ class Valve(object):
             if port_no not in self.dp.ports:
                 # Detected a newly configured port
                 changed_ports.add(port_no)
+                self.dpid_log('port %s added' % port_no)
             else:
-                if new_port != self.dp.ports[port_no]:
+                old_port = self.dp.ports[port_no]
+                if new_port != old_port:
                     # An existing port has configs changed
                     changed_ports.add(port_no)
                     self.dpid_log('port %s reconfigured' % port_no)
@@ -1241,29 +1255,31 @@ class Valve(object):
                 changed_vlans (list): changed/added VLAN IDs.
                 all_ports_changed (bool): True if all ports changed.
         Returns:
-            ofmsgs (list): OpenFlow messages.
+            tuple:
+                cold_start (bool): whether cold starting.
+                ofmsgs (list): OpenFlow messages.
         """
         (deleted_ports, changed_ports, deleted_vlans, changed_vlans,
          all_ports_changed) = changes
         new_dp.running = True
         ofmsgs = []
+        cold_start = True
 
         if all_ports_changed:
-            self.dpid_log('all ports changed config, so cold starting pipeline')
             self.dp = new_dp
             ofmsgs.extend(self.datapath_connect(self.dp.dp_id, changed_ports))
         else:
-            old_dp = self.dp
+            cold_start = False
             if deleted_ports:
                 self.dpid_log('ports deleted: %s' % deleted_ports)
-                for port_no in deleted_ports:
-                    old_eth_srcs = self._get_eth_srcs_learned_on_port(old_dp, port_no)
-                    ofmsgs.extend(self.port_delete(self.dp.dp_id, port_no, old_eth_srcs))
+                ofmsgs.extend(self.ports_delete(self.dp.dp_id, deleted_ports))
             if deleted_vlans:
                 self.dpid_log('VLANs deleted: %s' % deleted_vlans)
                 for vid in deleted_vlans:
                     vlan = self.dp.vlans[vid]
                     ofmsgs.extend(self._del_vlan(vlan))
+            if changed_ports:
+                ofmsgs.extend(self.ports_delete(self.dp.dp_id, changed_ports))
             self.dp = new_dp
             if changed_vlans:
                 self.dpid_log('VLANs changed/added: %s' % changed_vlans)
@@ -1273,11 +1289,8 @@ class Valve(object):
                     ofmsgs.extend(self._add_vlan(vlan, set()))
             if changed_ports:
                 self.dpid_log('ports changed/added: %s' % changed_ports)
-                for port_no in changed_ports:
-                    old_eth_srcs = self._get_eth_srcs_learned_on_port(old_dp, port_no)
-                    ofmsgs.extend(self.port_add(
-                        self.dp.dp_id, port_no, modify=True, old_eth_srcs=old_eth_srcs))
-        return ofmsgs
+                ofmsgs.extend(self.ports_add(self.dp.dp_id, changed_ports))
+        return cold_start, ofmsgs
 
     def reload_config(self, new_dp):
         """Reload configuration new_dp.
@@ -1292,7 +1305,9 @@ class Valve(object):
         Args:
             new_dp (DP): new dataplane configuration.
         Returns:
-            list: OpenFlow messages.
+            tuple of:
+                cold_start (bool): whether cold starting.
+                ofmsgs (list): OpenFlow messages.
         """
         if self.dp.running:
             return self._apply_config_changes(
@@ -1355,13 +1370,19 @@ class Valve(object):
             }
 
 
-class ArubaValve(Valve):
+class TfmValve(Valve):
     """Valve implementation that uses OpenFlow send table features messages."""
 
+    PIPELINE_CONF = 'tfm_pipeline.json'
+
     def switch_features(self, dp_id, msg):
-        ryu_table_loader = aruba.LoadRyuTables()
-        ryu_table_loader.load_tables(
-            os.path.join(aruba.CFG_PATH, 'aruba_pipeline.json'), parser)
-        ofmsgs = [valve_of.table_features(ryu_table_loader.ryu_tables)]
+        ryu_table_loader = tfm_pipeline.LoadRyuTables(
+            self.dp.pipeline_config_dir, self.PIPELINE_CONF)
         self.dpid_log('loading pipeline configuration')
-        return ofmsgs
+        return [valve_of.table_features(ryu_table_loader.load_tables())]
+
+
+class ArubaValve(TfmValve):
+    """Valve implementation that uses OpenFlow send table features messages."""
+
+    PIPELINE_CONF = 'aruba_pipeline.json'
